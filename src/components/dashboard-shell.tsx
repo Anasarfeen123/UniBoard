@@ -9,9 +9,11 @@ import { FooterDisclaimer } from "@/components/footer-disclaimer"
 import { getSessionMode, getStoredProfile } from "@/lib/app-session"
 import { useToast } from "@/components/toast-provider"
 import { Badge } from "@/components/ui/badge"
+import { useVtopSync } from "@/hooks/use-vtop-sync"
 
 export function DashboardShell({ children }: { children: React.ReactNode }) {
   const [syncing, setSyncing] = React.useState(false)
+  const vtop = useVtopSync({ autoRefreshMs: 1000 * 60 * 20 })
   const [initials] = React.useState(() => {
     const profile = getStoredProfile()
     if (!profile?.fullName) return "AJ"
@@ -27,12 +29,20 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 
   async function syncWorkspace() {
     setSyncing(true)
-    await new Promise((resolve) => window.setTimeout(resolve, 900))
+    const result = await vtop.syncNow()
     setSyncing(false)
+    if (result.ok) {
+      notify({
+        title: demo ? "Demo data refreshed" : "VTOP Chennai synced",
+        description: "Attendance, timetable, GPA, fees, and profile data were refreshed.",
+        tone: "success",
+      })
+      return
+    }
     notify({
-      title: demo ? "Demo data refreshed" : "Workspace synced",
-      description: "Attendance, timetable, GPA, and fees are up to date.",
-      tone: "success",
+      title: result.code === "SESSION_EXPIRED" ? "Reconnect VTOP" : "Sync failed",
+      description: result.message,
+      tone: "warning",
     })
   }
 
@@ -51,7 +61,11 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
               <Badge variant="outline" className="mt-1 rounded-none border-primary/20 bg-primary/5 text-[10px]">
                 Demo Workspace
               </Badge>
-            ) : null}
+            ) : (
+              <Badge variant="outline" className="mt-1 rounded-none border-primary/20 bg-primary/5 text-[10px]">
+                {vtop.state.connected ? `VTOP live · ${vtop.state.lastSyncedAt ? new Date(vtop.state.lastSyncedAt).toLocaleTimeString() : "sync ready"}` : "VTOP not connected"}
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -74,7 +88,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
               onClick={syncWorkspace}
             >
               <RefreshCw className={syncing ? "h-3 w-3 animate-spin" : "h-3 w-3"} />
-              {syncing ? "Syncing" : "Sync"}
+              {syncing ? "Syncing" : "Sync Now"}
             </Button>
             <div className="flex h-8 w-8 items-center justify-center rounded-full border border-border text-[10px] font-bold">
               {initials}

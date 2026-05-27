@@ -3,12 +3,12 @@
 import {
   Area,
   AreaChart,
-  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
   CartesianGrid,
 } from "recharts"
+import { MeasuredChart } from "@/components/measured-chart"
 
 const data = [
   { semester: "Sem 1", gpa: 3.2 },
@@ -19,9 +19,9 @@ const data = [
 
 export function PerformanceChart() {
   return (
-    <div className="h-[300px] w-full mt-4">
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data}>
+    <MeasuredChart height={300}>
+      {(width, height) => (
+        <AreaChart data={data} width={width} height={height}>
           <defs>
             <pattern
               id="grid"
@@ -69,7 +69,7 @@ export function PerformanceChart() {
             fillOpacity={1}
           />
         </AreaChart>
-      </ResponsiveContainer>
-    </div>
+      )}
+    </MeasuredChart>
   )
 }

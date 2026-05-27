@@ -1,123 +1,95 @@
-import { mockAcademicRecords, currentUser } from "@/lib/mock-data";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { FileText, Download } from "lucide-react";
-import { ActionButton } from "@/components/action-button";
+"use client"
+
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { useToast } from "@/components/toast-provider"
+import { useVtopSync } from "@/hooks/use-vtop-sync"
+import { FileText, RefreshCw } from "lucide-react"
 
 export default function MarksPage() {
-  const student = currentUser; // Focusing on the current user
+  const { notify } = useToast()
+  const vtop = useVtopSync()
+  const marks = vtop.data?.marks ?? []
+  const latest = vtop.data?.gpa.find((item) => item.cgpa || item.gpa)
+  const graded = marks.filter((item) => item.grade).length
+
+  async function sync() {
+    const result = await vtop.syncNow()
+    notify({ title: result.ok ? "Academic records refreshed" : "Marks sync failed", description: result.message, tone: result.ok ? "success" : "warning" })
+  }
 
   return (
     <div className="space-y-8 e-ink-refresh">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <div>
-          <h2 className="text-3xl font-serif font-bold tracking-tight">Academic Records</h2>
-          <p className="text-muted-foreground text-sm">Detailed performance breakdown for {student.name}</p>
+          <h2 className="font-serif text-3xl font-bold tracking-tight">Academic Records</h2>
+          <p className="text-sm text-muted-foreground">Marks, GPA, and grade history synced from VTOP Chennai.</p>
         </div>
-        <div className="flex gap-2">
-          <ActionButton
-            variant="outline"
-            className="rounded-none gap-2"
-            feedback="Transcript exported"
-            detail="Your semester transcript has been prepared as a spreadsheet."
-          >
-            <Download className="h-4 w-4" />
-            Export Transcript
-          </ActionButton>
-          <ActionButton
-            className="rounded-none gap-2"
-            feedback="Record entry opened"
-            detail="Manual records are staged locally until the next sync."
-          >
-            <FileText className="h-4 w-4" />
-            Add Record
-          </ActionButton>
-        </div>
+        <Button className="rounded-none gap-2" onClick={sync} disabled={vtop.syncing}>
+          <RefreshCw className={vtop.syncing ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+          Sync Now
+        </Button>
       </div>
 
       <div className="grid gap-6 md:grid-cols-3">
-        <Card className="rounded-none border-border/50 bg-card/50 premium-card">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs font-medium uppercase tracking-widest text-muted-foreground">Semester GPA</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-bold">3.82</div>
-            <p className="text-[10px] text-muted-foreground mt-1 font-mono">Rank: #4 in Department</p>
-          </CardContent>
-        </Card>
-        <Card className="rounded-none border-border/50 bg-card/50 premium-card">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs font-medium uppercase tracking-widest text-muted-foreground">Cumulative GPA</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-bold">3.75</div>
-            <p className="text-[10px] text-muted-foreground mt-1 font-mono">Credits Earned: 124/160</p>
-          </CardContent>
-        </Card>
-        <Card className="rounded-none border-border/50 bg-card/50 premium-card">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-xs font-medium uppercase tracking-widest text-muted-foreground">Grade Summary</CardTitle>
-          </CardHeader>
-          <CardContent className="flex gap-4">
-            <div className="text-center">
-              <div className="text-xl font-bold">4</div>
-              <p className="text-[8px] uppercase tracking-tighter text-muted-foreground font-mono">A-Grades</p>
-            </div>
-            <div className="text-center border-l border-border/50 pl-4">
-              <div className="text-xl font-bold">2</div>
-              <p className="text-[8px] uppercase tracking-tighter text-muted-foreground font-mono">B-Grades</p>
-            </div>
-            <div className="text-center border-l border-border/50 pl-4">
-              <div className="text-xl font-bold">0</div>
-              <p className="text-[8px] uppercase tracking-tighter text-muted-foreground font-mono">C/Below</p>
-            </div>
-          </CardContent>
-        </Card>
+        {[
+          ["Semester GPA", latest?.gpa?.toFixed(2) ?? "Pending", "From latest VTOP grade view"],
+          ["Cumulative GPA", latest?.cgpa?.toFixed(2) ?? "Pending", "Fetched after successful sync"],
+          ["Grade Entries", graded || "Pending", vtop.syncing ? "Updating semester analytics..." : "Synced assessment rows"],
+        ].map(([label, value, detail]) => (
+          <Card key={label} className="rounded-none border-border/50 bg-card/50 premium-card">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-xs font-medium uppercase tracking-widest text-muted-foreground">{label}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-3xl font-bold">{value}</div>
+              <p className="mt-1 font-mono text-[10px] text-muted-foreground">{detail}</p>
+            </CardContent>
+          </Card>
+        ))}
       </div>
 
       <div className="space-y-4">
-        <h3 className="text-lg font-serif font-semibold">Semester 4 Performance</h3>
-        <div className="border border-border/50 bg-card/50 overflow-hidden">
-          <Table>
-            <TableHeader className="bg-muted/30">
-              <TableRow className="border-border/50">
-                <TableHead className="uppercase tracking-wider text-[10px]">Code</TableHead>
-                <TableHead className="uppercase tracking-wider text-[10px]">Subject</TableHead>
-                <TableHead className="uppercase tracking-wider text-[10px]">Credits</TableHead>
-                <TableHead className="uppercase tracking-wider text-[10px]">Type</TableHead>
-                <TableHead className="uppercase tracking-wider text-[10px]">Score</TableHead>
-                <TableHead className="uppercase tracking-wider text-[10px]">Grade</TableHead>
-                <TableHead className="uppercase tracking-wider text-[10px]">Weight</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {mockAcademicRecords.map((record) => (
-                <TableRow key={record.id} className="border-border/50">
-                  <TableCell className="font-mono text-xs">{record.subjectCode}</TableCell>
-                  <TableCell className="font-medium">{record.subjectName}</TableCell>
-                  <TableCell className="text-sm">{record.credits}</TableCell>
-                  <TableCell className="text-xs uppercase tracking-tighter text-muted-foreground">{record.testType}</TableCell>
-                  <TableCell className="font-mono text-sm">{record.score}/{record.maxMarks}</TableCell>
-                  <TableCell>
-                    <Badge variant="outline" className="rounded-none text-xs font-bold border-primary/20 bg-primary/5">
-                      {record.grade}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{record.weightage}%</TableCell>
+        <h3 className="font-serif text-lg font-semibold">Synced Assessment Records</h3>
+        <div className="overflow-hidden border border-border/50 bg-card/50">
+          {marks.length ? (
+            <Table>
+              <TableHeader className="bg-muted/30">
+                <TableRow className="border-border/50">
+                  <TableHead className="text-[10px] uppercase tracking-wider">Code</TableHead>
+                  <TableHead className="text-[10px] uppercase tracking-wider">Subject</TableHead>
+                  <TableHead className="text-[10px] uppercase tracking-wider">Assessment</TableHead>
+                  <TableHead className="text-[10px] uppercase tracking-wider">Score</TableHead>
+                  <TableHead className="text-[10px] uppercase tracking-wider">Grade</TableHead>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+              </TableHeader>
+              <TableBody>
+                {marks.map((record, index) => (
+                  <TableRow key={`${record.courseCode}-${record.assessment}-${index}`} className="border-border/50">
+                    <TableCell className="font-mono text-xs">{record.courseCode || "-"}</TableCell>
+                    <TableCell className="font-medium">{record.courseTitle}</TableCell>
+                    <TableCell className="text-xs uppercase tracking-tighter text-muted-foreground">{record.assessment}</TableCell>
+                    <TableCell className="font-mono text-sm">{record.scored ?? "-"}{record.max ? `/${record.max}` : ""}</TableCell>
+                    <TableCell>
+                      <Badge variant="outline" className="rounded-none text-xs font-bold">
+                        {record.grade ?? "Pending"}
+                      </Badge>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          ) : (
+            <div className="flex min-h-56 flex-col items-center justify-center gap-3 p-6 text-center">
+              <FileText className="h-8 w-8 text-muted-foreground" />
+              <p className="font-serif text-xl font-semibold">Marks await VTOP sync</p>
+              <p className="max-w-md text-sm text-muted-foreground">{vtop.error?.message ?? "Connect VTOP Chennai to populate real marks and GPA."}</p>
+            </div>
+          )}
         </div>
       </div>
     </div>
-  );
+  )
 }

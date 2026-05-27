@@ -10,7 +10,7 @@ import {
   Clock,
   ArrowRight
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { buttonVariants } from "@/components/ui/button";
 import { ActionButton } from "@/components/action-button";
 
 export default function DashboardPage() {
@@ -89,9 +89,9 @@ export default function DashboardPage() {
         <Card className="lg:col-span-4 rounded-none border-border/50 bg-card/50 overflow-hidden">
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="text-sm font-medium uppercase tracking-widest">Performance History</CardTitle>
-            <Button render={<Link href="/marks" />} variant="ghost" size="sm" className="h-8 text-[10px] uppercase tracking-widest gap-2">
+            <Link href="/marks" className={buttonVariants({ variant: "ghost", size: "sm", className: "h-8 text-[10px] uppercase tracking-widest gap-2" })}>
               Full Transcript <ArrowRight className="h-3 w-3" />
-            </Button>
+            </Link>
           </CardHeader>
           <CardContent className="pl-2">
             <PerformanceChart />

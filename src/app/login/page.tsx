@@ -8,37 +8,172 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { FooterDisclaimer } from "@/components/footer-disclaimer"
-import { getStoredProfile, setSessionMode, storeProfile } from "@/lib/app-session"
+import { setSessionMode, storeProfile } from "@/lib/app-session"
 import { useToast } from "@/components/toast-provider"
+import type { VtopApiResponse } from "@/lib/vtop/types"
 
 export default function LoginPage() {
   const router = useRouter()
   const { notify } = useToast()
   const [loading, setLoading] = React.useState<"login" | "demo" | null>(null)
+  const [status, setStatus] = React.useState<string>("")
   const [showPassword, setShowPassword] = React.useState(false)
   const [remember, setRemember] = React.useState(true)
+  const [challenge, setChallenge] = React.useState<{ challengeId: string; captchaImage: string | null }>()
+  const [challengeLoading, setChallengeLoading] = React.useState(true)
+  const [takingLong, setTakingLong] = React.useState(false)
+  const [challengeError, setChallengeError] = React.useState<string>()
+  const isSubmitting = React.useRef(false)
+
+  const loadChallenge = React.useCallback(async () => {
+    setChallengeLoading(true)
+    setTakingLong(false)
+    setChallengeError(undefined)
+    setChallenge(undefined) // Immediately invalidate old challenge
+    
+    const longTimer = window.setTimeout(() => setTakingLong(true), 10_000)
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => controller.abort(), 25_000)
+    try {
+      const response = await fetch("/api/vtop/challenge", { cache: "no-store", signal: controller.signal })
+      const payload = (await response.json()) as
+        | { ok: true; challenge: { challengeId: string; captchaImage: string | null } }
+        | { ok: false; message: string }
+      if (payload.ok) {
+        setChallenge(payload.challenge)
+      } else {
+        setChallengeError(payload.message)
+        notify({ title: "VTOP CAPTCHA unavailable", description: payload.message, tone: "warning" })
+      }
+    } catch (error) {
+      const timedOut = error instanceof DOMException && error.name === "AbortError"
+      const message = timedOut
+        ? "VTOP Chennai took too long to return a CAPTCHA. Try again in a few seconds."
+        : "UniBoard could not prepare the official VTOP Chennai login challenge."
+      setChallengeError(message)
+      notify({
+        title: "VTOP CAPTCHA unavailable",
+        description: message,
+        tone: "warning",
+      })
+    } finally {
+      window.clearTimeout(timeout)
+      window.clearTimeout(longTimer)
+      setChallengeLoading(false)
+      setTakingLong(false)
+    }
+  }, [notify])
+
+  React.useEffect(() => {
+    let mounted = true
+    const timer = window.setTimeout(() => {
+       if (mounted) void loadChallenge()
+    }, 0)
+    return () => {
+       mounted = false
+       window.clearTimeout(timer)
+    }
+  }, [loadChallenge])
 
   async function handleLogin(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    setLoading("login")
-    await new Promise((resolve) => window.setTimeout(resolve, 850))
-    const profile = getStoredProfile()
-    if (!profile) {
+    if (loading !== null || isSubmitting.current) return
+    
+    isSubmitting.current = true
+
+    const form = new FormData(event.currentTarget)
+    const username = String(form.get("username") ?? "").trim()
+    const password = String(form.get("password") ?? "")
+    const captcha = String(form.get("captcha") ?? "").trim()
+
+    if (!username || !password || (challenge?.captchaImage && !captcha) || !challenge?.challengeId) {
       notify({
-        title: "Setup needed first",
-        description: "Create your private student workspace before signing in.",
+        title: "VTOP details needed",
+        description: challenge?.captchaImage 
+          ? "Enter your VTOP Chennai credentials and the CAPTCHA shown by VTOP."
+          : "Enter your VTOP Chennai username and password.",
         tone: "warning",
       })
-      router.push("/onboarding")
+      isSubmitting.current = false
       return
     }
-    setSessionMode("student")
-    notify({
-      title: remember ? "Secure session restored" : "Signed in for this session",
-      description: "Your academic workspace is ready.",
-      tone: "success",
-    })
-    router.push("/")
+
+    setLoading("login")
+    setStatus("Connecting to VTOP...")
+    
+    // Simulate progress updates for better UX transparency
+    const statusInterval = window.setInterval(() => {
+      setStatus(prev => {
+        if (prev === "Connecting to VTOP...") return "Authenticating credentials..."
+        if (prev === "Authenticating credentials...") return "Navigating VTOP portal..."
+        if (prev === "Navigating VTOP portal...") return "Resolving conflicts..."
+        if (prev === "Resolving conflicts...") return "Fetching academic records..."
+        return prev
+      })
+    }, 2500)
+
+    try {
+      const response = await fetch("/api/vtop/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password, remember, captcha, challengeId: challenge.challengeId }),
+      })
+      const payload = (await response.json()) as VtopApiResponse
+      
+      window.clearInterval(statusInterval)
+
+      if (!payload.ok) {
+        notify({
+          title: payload.code === "CAPTCHA_REQUIRED" || payload.code === "CAPTCHA_INVALID" ? "VTOP CAPTCHA rejected" : "VTOP connection failed",
+          description: payload.message,
+          tone: "warning",
+        })
+        
+        // Always load a new challenge on failure because the backend deletes the challenge upon processing
+        void loadChallenge()
+        
+        setLoading(null)
+        setStatus("")
+        return
+      }
+      
+      setStatus("Syncing academic data...")
+      if (payload.data?.profile) {
+        storeProfile({
+          fullName: payload.data.profile.fullName || username,
+          vtopUsername: username,
+          registrationNumber: payload.data.profile.registrationNumber,
+          branch: payload.data.profile.branch || payload.data.profile.program,
+          semester: payload.data.profile.semester,
+          profilePicture: payload.data.profile.profilePhoto,
+        })
+      } else {
+        storeProfile({
+          fullName: username,
+          vtopUsername: username,
+          registrationNumber: "",
+          branch: "VTOP Chennai",
+          semester: "",
+        })
+      }
+
+      setSessionMode("student")
+      notify({
+        title: "VTOP Chennai connected",
+        description: "Fetched your latest academic data into UniBoard.",
+        tone: "success",
+      })
+      router.push("/")
+    } catch {
+      notify({
+        title: "Network issue",
+        description: "UniBoard could not reach the local VTOP connector. Try again in a moment.",
+        tone: "warning",
+      })
+      setLoading(null)
+    } finally {
+      isSubmitting.current = false
+    }
   }
 
   async function tryDemo() {
@@ -85,7 +220,7 @@ export default function LoginPage() {
               Your calm command center for VIT academics.
             </h1>
             <p className="mt-5 max-w-md text-sm leading-6 text-muted-foreground">
-              Track attendance, GPA, timetable, fees, and personal academic signals in one quiet workspace.
+                  Connect securely to VTOP Chennai to track attendance, GPA, timetable, fees, and academic signals in one quiet workspace.
             </p>
           </div>
 
@@ -98,20 +233,21 @@ export default function LoginPage() {
               <div className="mb-8">
                 <h2 className="font-serif text-2xl font-semibold">Sign in</h2>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  Your credentials are only used to securely fetch your academic data.
+                  VTOP Chennai only. Your credentials are only used to securely fetch your academic data.
                 </p>
               </div>
 
               <form className="space-y-4" onSubmit={handleLogin}>
                 <div className="space-y-2">
                   <label className="text-[10px] uppercase tracking-widest text-muted-foreground">VTOP Username</label>
-                  <Input required placeholder="your.vtop.id" className="rounded-none bg-background" />
+                  <Input required name="username" placeholder="VTOP Chennai username" className="rounded-none bg-background" />
                 </div>
                 <div className="space-y-2">
                   <label className="text-[10px] uppercase tracking-widest text-muted-foreground">VTOP Password</label>
                   <div className="relative">
                     <Input
                       required
+                      name="password"
                       type={showPassword ? "text" : "password"}
                       placeholder="Password"
                       className="rounded-none bg-background pr-10"
@@ -128,7 +264,62 @@ export default function LoginPage() {
                     </Button>
                   </div>
                 </div>
-
+                <div className="space-y-2">
+                  {challenge && !challenge.captchaImage ? (
+                    <div className="flex items-center gap-2 rounded-none border border-border bg-muted/30 px-3 py-2 text-[10px] uppercase tracking-widest text-muted-foreground animate-in fade-in slide-in-from-top-1">
+                      <ShieldCheck className="h-3 w-3" />
+                      VTOP CAPTCHA not required for this session
+                    </div>
+                  ) : (
+                    <div className={challenge && !challenge.captchaImage ? "hidden" : "space-y-2"}>
+                      <div className="flex items-center justify-between gap-3">
+                        <label className="text-[10px] uppercase tracking-widest text-muted-foreground">VTOP CAPTCHA</label>
+                        <button
+                          type="button"
+                          className="text-[10px] uppercase tracking-widest text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+                          onClick={loadChallenge}
+                          disabled={challengeLoading || loading !== null}
+                        >
+                          Refresh
+                        </button>
+                      </div>
+                      <div className="border border-border bg-background p-2">
+                        {challengeLoading ? (
+                          <div className="flex h-14 flex-col items-center justify-center gap-1">
+                            <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Fetching VTOP CAPTCHA...</div>
+                            {takingLong && <div className="text-[9px] text-muted-foreground/60 animate-pulse">Taking longer than usual...</div>}
+                          </div>
+                        ) : challenge?.captchaImage ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={challenge.captchaImage} alt="VTOP CAPTCHA" className="mx-auto h-14 max-w-full object-contain" />
+                        ) : challengeError ? (
+                          <div className="flex min-h-16 flex-col items-center justify-center gap-2 px-3 py-2 text-center">
+                            <p className="text-xs text-muted-foreground">{challengeError}</p>
+                            <button
+                              type="button"
+                              className="text-[10px] uppercase tracking-widest text-foreground underline-offset-4 hover:underline"
+                              onClick={loadChallenge}
+                            >
+                              Try fetching again
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex h-14 items-center justify-center text-[10px] uppercase tracking-widest text-muted-foreground">
+                            CAPTCHA unavailable
+                          </div>
+                        )}
+                      </div>
+                      <Input
+                        required={!!(challenge && challenge.captchaImage)}
+                        name="captcha"
+                        placeholder="Enter CAPTCHA"
+                        maxLength={6}
+                        className="rounded-none bg-background uppercase"
+                        autoComplete="off"
+                      />
+                    </div>
+                  )}
+                </div>
                 <label className="flex items-center gap-2 text-xs text-muted-foreground">
                   <input
                     type="checkbox"
@@ -136,12 +327,19 @@ export default function LoginPage() {
                     onChange={(event) => setRemember(event.target.checked)}
                     className="h-3.5 w-3.5 accent-foreground"
                   />
-                  Remember this private session
+                  Remember encrypted VTOP session on this device
                 </label>
 
-                <Button type="submit" className="h-10 w-full rounded-none gap-2" disabled={loading !== null}>
-                  {loading === "login" ? "Opening workspace..." : "Enter Workspace"}
-                  {loading !== "login" ? <ArrowRight className="h-4 w-4" /> : null}
+                <Button type="submit" className="h-10 w-full rounded-none gap-2 flex-col items-center justify-center py-6" disabled={loading !== null || challengeLoading}>
+                  <div className="flex items-center gap-2">
+                    {loading === "login" ? status : "Connect VTOP Chennai"}
+                    {loading !== "login" ? <ArrowRight className="h-4 w-4" /> : null}
+                  </div>
+                  {loading === "login" && (
+                    <div className="text-[9px] uppercase tracking-[0.2em] opacity-70 animate-pulse">
+                      Processing Background Scraper...
+                    </div>
+                  )}
                 </Button>
               </form>
 
@@ -165,7 +363,7 @@ export default function LoginPage() {
               <div className="mt-6 space-y-3 border-t border-border/50 pt-6">
                 <p className="flex items-start gap-2 text-xs text-muted-foreground">
                   <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
-                  Secure-looking local session flow for a personal dashboard. No data selling or sharing.
+                  UniBoard opens a secure browser session for VTOP Chennai and keeps credentials encrypted. Users log in at their own discretion.
                 </p>
                 <p className="text-xs text-muted-foreground">
                   First time here?{" "}

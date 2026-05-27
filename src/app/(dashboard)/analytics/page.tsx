@@ -5,7 +5,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { 
   Bar, 
   BarChart, 
-  ResponsiveContainer, 
   XAxis, 
   YAxis, 
   Tooltip,
@@ -17,6 +16,7 @@ import {
 import { Download, Share2, Filter } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/toast-provider";
+import { MeasuredChart } from "@/components/measured-chart";
 
 const subjectPerformance = [
   { name: "Data Structures", avg: 9.2 },
@@ -93,9 +93,9 @@ export default function AnalyticsPage() {
             <CardTitle className="text-sm font-medium uppercase tracking-widest">Subject Strength Index</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="h-[300px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={subjectPerformance}>
+            <MeasuredChart height={300}>
+              {(width, height) => (
+                <BarChart data={subjectPerformance} width={width} height={height}>
                   <XAxis 
                     dataKey="name" 
                     stroke="var(--muted-foreground)" 
@@ -124,8 +124,8 @@ export default function AnalyticsPage() {
                     ))}
                   </Bar>
                 </BarChart>
-              </ResponsiveContainer>
-            </div>
+              )}
+            </MeasuredChart>
           </CardContent>
         </Card>
 
@@ -134,9 +134,9 @@ export default function AnalyticsPage() {
             <CardTitle className="text-sm font-medium uppercase tracking-widest">Growth Index</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="h-[300px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={growthData}>
+            <MeasuredChart height={300}>
+              {(width, height) => (
+                <LineChart data={growthData} width={width} height={height}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="var(--border)" />
                   <XAxis 
                     dataKey="month" 
@@ -174,8 +174,8 @@ export default function AnalyticsPage() {
                     dot={{ strokeWidth: 2, r: 4, fill: 'var(--background)' }}
                   />
                 </LineChart>
-              </ResponsiveContainer>
-            </div>
+              )}
+            </MeasuredChart>
           </CardContent>
         </Card>
       </div>
