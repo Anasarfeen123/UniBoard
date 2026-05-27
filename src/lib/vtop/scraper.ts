@@ -86,6 +86,15 @@ function parseNumber(value: string) {
 
 function classifyLoginFailure(text: string) {
   const t = text.toLowerCase()
+  
+  if (/maintenance|under maintenance|scheduled maintenance|site is down|not available/i.test(t) && t.includes("vtop")) {
+    throw new VtopScraperError("VTOP_DOWN", "VTOP Chennai is currently under maintenance. Please try again later.")
+  }
+  
+  if (/database connection error|connection pool|database error|could not connect to database/i.test(t)) {
+    throw new VtopScraperError("VTOP_DOWN", "VTOP Chennai database is currently unreachable. This is usually a temporary portal issue.")
+  }
+
   if (
     t.includes("invalid captcha") || 
     t.includes("wrong captcha") || 
@@ -122,52 +131,99 @@ function classifyLoginFailure(text: string) {
 }
 
 async function tableRows(page: Page, labels: string[]) {
-  const lowered = labels.map((item) => item.toLowerCase())
+  const needles = labels.map((item) => item.toLowerCase())
   const frames = page.frames()
   
   for (const frame of frames) {
-    const rows = await frame.evaluate((needles) => {
-      const tables = [...document.querySelectorAll("table")]
-      const result: string[][] = []
-
-      for (const table of tables) {
-        const text = table.textContent?.toLowerCase() ?? ""
-        if (!needles.some((needle) => text.includes(needle))) continue
-        for (const row of [...table.querySelectorAll("tr")]) {
-          const cells = [...row.querySelectorAll("th,td")]
-            .map((cell) => cell.textContent?.replace(/\s+/g, " ").trim() ?? "")
-            .filter(Boolean)
-          if (cells.length > 1) result.push(cells)
-        }
+    try {
+      // Check for session timeout inside the frame
+      const bodyText = await frame.locator("body").textContent({ timeout: 1000 }).catch(() => "")
+      if (/session timed out|login again|logged out/i.test(bodyText || "")) {
+        console.warn(`[VTOP-Scrape] Session timeout detected in frame: ${frame.url()}`)
+        continue
       }
 
-      return result
-    }, lowered).catch(() => [] as string[][])
-    
-    if (rows.length > 0) return rows
+      const rows = await frame.evaluate((needles) => {
+        const tables = Array.from(document.querySelectorAll("table"));
+        const allMatchingRows: string[][] = [];
+
+        for (const table of tables) {
+          const tableText = table.textContent?.toLowerCase() || "";
+          const containerText = table.parentElement?.textContent?.toLowerCase() || "";
+          
+          if (!needles.some((needle) => tableText.includes(needle) || containerText.includes(needle))) continue;
+          
+          const trs = Array.from(table.querySelectorAll("tr"));
+          for (const row of trs) {
+            const cells = Array.from(row.querySelectorAll("th, td"))
+              .map((cell) => cell.textContent?.replace(/\s+/g, " ").trim() ?? "");
+            
+            // Skip rows that look like headers (contain all needles or match common header patterns)
+            const isHeader = cells.some(c => /sl\.no|course code|subject|component|percentage|status|attended/i.test(c));
+            if (isHeader && cells.length > 2) continue;
+
+            if (cells.length > 1 && cells.some(c => c.length > 0)) {
+              allMatchingRows.push(cells);
+            }
+          }
+        }
+        return allMatchingRows;
+      }, needles).catch(() => [] as string[][])
+      
+      if (rows.length > 0) {
+        console.log(`[VTOP-Scrape] Extracted ${rows.length} data rows from frame: ${frame.url()}`);
+        return rows;
+      }
+    } catch (e) {
+      // Continue to next frame
+    }
   }
   
   return []
 }
 
 async function definitionValue(page: Page, labels: string[]) {
-  const lowered = labels.map((label) => label.toLowerCase())
+  const needles = labels.map((label) => label.toLowerCase())
   const frames = page.frames()
   
   for (const frame of frames) {
-    const value = await frame.evaluate((needles) => {
-      const nodes = [...document.querySelectorAll("td, th, label, span, div, p")]
-      for (let index = 0; index < nodes.length; index += 1) {
-        const text = nodes[index]?.textContent?.replace(/\s+/g, " ").trim() ?? ""
-        const normalized = text.toLowerCase().replace(/[:*]/g, "").trim()
-        if (!needles.includes(normalized)) continue
-        const sibling = nodes[index + 1]?.textContent?.replace(/\s+/g, " ").trim()
-        if (sibling && sibling !== text) return sibling
-      }
-      return ""
-    }, lowered).catch(() => "")
-    
-    if (value) return value
+    try {
+      const bodyText = await frame.locator("body").textContent({ timeout: 500 }).catch(() => "")
+      if (/session timed out|login again|logged out/i.test(bodyText || "")) continue;
+
+      const value = await frame.evaluate((needles) => {
+        // 1. Try finding in table cells (very common for profiles)
+        const cells = Array.from(document.querySelectorAll("td, th"));
+        for (let i = 0; i < cells.length; i++) {
+          const text = cells[i].textContent?.replace(/\s+/g, " ").trim().toLowerCase().replace(/[:*]/g, "").trim() || "";
+          
+          // Check for exact or partial match
+          if (needles.some(n => text === n || (text.length > 3 && n.includes(text)))) {
+            // Check if value is in the SAME cell (e.g. "Name: John Doe")
+            const fullText = cells[i].textContent?.trim() || "";
+            const parts = fullText.split(/[:\-]/);
+            if (parts.length > 1 && parts[1].trim().length > 0) return parts[1].trim();
+
+            // Check if value is in the NEXT cell
+            const next = cells[i + 1]?.textContent?.trim();
+            if (next && next.toLowerCase() !== text) return next;
+          }
+        }
+
+        // 2. Fallback to generic node search
+        const nodes = Array.from(document.querySelectorAll("label, span, div, p, b, strong"));
+        for (let index = 0; index < nodes.length; index += 1) {
+          const text = nodes[index]?.textContent?.replace(/\s+/g, " ").trim().toLowerCase().replace(/[:*]/g, "").trim() || "";
+          if (needles.some(n => text === n)) {
+            const sibling = nodes[index + 1]?.textContent?.replace(/\s+/g, " ").trim();
+            if (sibling && sibling.toLowerCase() !== text) return sibling;
+          }
+        }
+        return ""
+      }, needles).catch(() => "")
+      
+      if (value) return value
+    } catch (e) {}
   }
   
   return ""
@@ -176,30 +232,50 @@ async function definitionValue(page: Page, labels: string[]) {
 async function clickLikely(page: Page, terms: string[]) {
   console.log(`[VTOP-Scrape] Attempting to navigate to: ${terms[0]}`)
   
-  // First, try the highly reliable data-url approach for VTOP's specific AJAX routing
+  // Mapping of common search terms to known VTOP Chennai endpoints for direct fallback
+  const directEndpoints: Record<string, string> = {
+    profile: "studentsRecord/StudentProfileAllView",
+    attendance: "processAttendance/StudentAttendance",
+    marks: "examinations/StudentMarkView",
+    gpa: "examinations/StudentGradeHistory",
+    history: "examinations/StudentGradeHistory",
+    timetable: "timetable/StudentTimeTableChn",
+    exams: "examinations/StudExamSchedule",
+    fees: "accounts/getFeesIntimation",
+  }
+
+  const frames = page.frames()
+
+  // First, try the highly reliable data-url approach for VTOP's specific AJAX routing across all frames
   for (const term of terms) {
-    // Look for data-url attributes containing the term (e.g. 'studentsRecord/StudentProfileAllView' for 'profile')
-    const links = await page.locator(`[data-url*="${term}" i]`).all()
-    for (const link of links) {
-        try {
+    for (const frame of frames) {
+      try {
+        const links = await frame.locator(`[data-url*="${term}" i]`).all()
+        for (const link of links) {
             const dataUrl = await link.getAttribute('data-url')
             if (dataUrl) {
-                console.log(`[VTOP-Scrape] Found AJAX target: ${dataUrl}`)
-                // Execute VTOP's native routing function
-                const result = await page.evaluate((url) => {
-                    const id = (document.getElementById("authorizedIDX") as HTMLInputElement)?.value || "";
-                    const csrfToken = (document.querySelector('input[name="_csrf"]') as HTMLInputElement)?.value || "";
+                console.log(`[VTOP-Scrape] Found AJAX target in frame: ${dataUrl}`)
+                // Execute VTOP's native routing function in the context of the frame where it was found
+                const result = await frame.evaluate((url) => {
+                    const id = (document.getElementById("authorizedIDX") as HTMLInputElement)?.value || 
+                             (window.parent.document.getElementById("authorizedIDX") as HTMLInputElement)?.value || "";
+                    const csrfToken = (document.querySelector('input[name="_csrf"]') as HTMLInputElement)?.value || 
+                                    (window.parent.document.querySelector('input[name="_csrf"]') as HTMLInputElement)?.value || "";
                     const dataText = `verifyMenu=true&authorizedID=${id}&_csrf=${csrfToken}&nocache=${new Date().getTime()}`;
                     
                     try {
-                      if (typeof (window as any).ajaxB5Call === 'function') {
-                          (window as any).ajaxB5Call(url, dataText);
+                      const win = window as any;
+                      if (typeof win.ajaxB5Call === 'function') {
+                          win.ajaxB5Call(url, dataText);
                           return { success: true, method: 'ajaxB5Call' };
-                      } else if (typeof (window as any).ajaxCall === 'function') {
-                          (window as any).ajaxCall(url, dataText);
+                      } else if (typeof win.ajaxCall === 'function') {
+                          win.ajaxCall(url, dataText);
                           return { success: true, method: 'ajaxCall' };
+                      } else if (typeof win.parent.ajaxB5Call === 'function') {
+                          win.parent.ajaxB5Call(url, dataText);
+                          return { success: true, method: 'parent.ajaxB5Call' };
                       } else {
-                          return { success: false, error: "No VTOP ajax routing function found on window" };
+                          return { success: false, error: "No VTOP ajax routing function found" };
                       }
                     } catch (e: any) {
                       return { success: false, error: e.toString() }
@@ -210,28 +286,63 @@ async function clickLikely(page: Page, terms: string[]) {
                    console.log(`[VTOP-Scrape] Successfully executed native routing via ${result.method}`)
                    await page.waitForTimeout(2500) // Wait for AJAX to populate DOM
                    return true
-                } else {
-                   console.warn(`[VTOP-Scrape] Native evaluation failed: ${result.error}`)
                 }
             }
-        } catch (e) {
-            console.warn(`[VTOP-Scrape] Native AJAX call failed for ${term}:`, e)
         }
+      } catch (e) {}
+    }
+  }
+
+  // Second, try direct endpoint call if we have a mapping for the term
+  for (const term of terms) {
+    const endpoint = directEndpoints[term.toLowerCase()]
+    if (endpoint) {
+       console.log(`[VTOP-Scrape] Attempting direct fallback to endpoint: ${endpoint}`)
+       // Try evaluating in the main frame and parent frames
+       for (const frame of frames) {
+         try {
+           const result = await frame.evaluate((url) => {
+              const id = (document.getElementById("authorizedIDX") as HTMLInputElement)?.value || 
+                       (window.parent.document.getElementById("authorizedIDX") as HTMLInputElement)?.value || "";
+              const csrfToken = (document.querySelector('input[name="_csrf"]') as HTMLInputElement)?.value || 
+                              (window.parent.document.querySelector('input[name="_csrf"]') as HTMLInputElement)?.value || "";
+              const dataText = `verifyMenu=true&authorizedID=${id}&_csrf=${csrfToken}&nocache=${new Date().getTime()}`;
+              
+              try {
+                const win = window as any;
+                if (typeof win.ajaxB5Call === 'function') {
+                    win.ajaxB5Call(url, dataText);
+                    return { success: true };
+                } else if (typeof win.ajaxCall === 'function') {
+                    win.ajaxCall(url, dataText);
+                    return { success: true };
+                }
+              } catch (e) {}
+              return { success: false };
+           }, endpoint)
+
+           if (result.success) {
+              console.log(`[VTOP-Scrape] Successfully executed direct routing to ${endpoint}`)
+              await page.waitForTimeout(2500)
+              return true
+           }
+         } catch (e) {}
+       }
     }
   }
 
   // Fallback to text clicking if data-url routing fails
   for (const term of terms) {
-    const link = page.getByText(new RegExp(term, "i")).first()
-    try {
-      if (await link.count() > 0) {
-        console.log(`[VTOP-Scrape] Fallback: Clicking text '${term}'...`)
-        await link.click({ timeout: 2500 })
-        await page.waitForTimeout(1500)
-        return true
-      }
-    } catch (e) {
-      // Continue trying
+    for (const frame of frames) {
+      const link = frame.getByText(new RegExp(term, "i")).first()
+      try {
+        if (await link.count() > 0) {
+          console.log(`[VTOP-Scrape] Fallback: Clicking text '${term}' in frame...`)
+          await link.click({ timeout: 2500 })
+          await page.waitForTimeout(1500)
+          return true
+        }
+      } catch (e) {}
     }
   }
   
@@ -310,14 +421,31 @@ async function login(page: Page, input: VtopLoginInput) {
   // Poll for up to 10 seconds to see if we navigate or an error appears
   console.log("[VTOP] Polling for login success or errors...")
   let afterLoginText = ""
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 15; i++) {
     await page.waitForTimeout(1000)
     
+    // Explicitly check if we are stuck on the login error page
+    if (page.url().includes("/login/error")) {
+       afterLoginText = await getAllPageText(page)
+       classifyLoginFailure(afterLoginText)
+       // If no specific error was classified but we are on /error, it's still a failure
+       console.error("[VTOP] Login failed: Redirected to /vtop/login/error")
+       throw new VtopScraperError("WRONG_CREDENTIALS", "VTOP Chennai login failed. Please check your credentials.")
+    }
+
     // VTOP uses AJAX for the dashboard load. Check for definitive DOM elements indicating success.
-    const isDashboard = await page.locator('#authorizedIDX, .VITEmblem, #vtopHeader').first().count() > 0
+    // Use a frame-aware check for the authorizedID which is the most reliable marker.
+    let foundAuthMarker = false
+    const frames = page.frames()
+    for (const frame of frames) {
+       if (await frame.locator("#authorizedIDX").count() > 0) {
+          foundAuthMarker = true
+          break
+       }
+    }
     
-    if (isDashboard || page.url().includes("/vtop/content")) {
-       console.log("[VTOP] Login confirmed via dashboard DOM elements.")
+    if (foundAuthMarker || page.url().includes("/vtop/content") || page.url().includes("/vtop/home")) {
+       console.log("[VTOP] Login confirmed via session markers.")
        afterLoginText = "dashboard" // Force success state
        break
     }
@@ -337,7 +465,7 @@ async function login(page: Page, input: VtopLoginInput) {
     }
 
     if (/student|profile|attendance|timetable|course|semester|logout|sign out|menu|dashboard|academic|grade|welcome|home|main|faculty|registration/i.test(afterLoginText)) {
-      console.log("[VTOP] Login confirmed. Workspace identified.")
+      console.log("[VTOP] Login confirmed via text identification.")
       break
     }
   }
@@ -579,14 +707,29 @@ export async function syncVtopWithChallenge(input: VtopLoginInput & { challengeI
     // Poll for up to 10 seconds to see if we navigate or an error appears
     console.log("[VTOP] Polling for login success or errors...")
     let text = ""
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 15; i++) {
       await page.waitForTimeout(1000)
       
+      // Explicitly check if we are stuck on the login error page
+      if (page.url().includes("/login/error")) {
+          text = await getAllPageText(page)
+          classifyLoginFailure(text)
+          console.error("[VTOP] Login failed: Redirected to /vtop/login/error")
+          throw new VtopScraperError("WRONG_CREDENTIALS", "VTOP Chennai login failed. Please check your credentials.")
+      }
+
       // VTOP uses AJAX for the dashboard load. Check for definitive DOM elements indicating success.
-      const isDashboard = await page.locator('#authorizedIDX, .VITEmblem, #vtopHeader').first().count() > 0
+      let foundAuthMarker = false
+      const frames = page.frames()
+      for (const frame of frames) {
+         if (await frame.locator("#authorizedIDX").count() > 0) {
+            foundAuthMarker = true
+            break
+         }
+      }
       
-      if (isDashboard || page.url().includes("/vtop/content")) {
-         console.log("[VTOP] Login confirmed via dashboard DOM elements.")
+      if (foundAuthMarker || page.url().includes("/vtop/content") || page.url().includes("/vtop/home")) {
+         console.log("[VTOP] Login confirmed via session markers.")
          text = "dashboard" // Force success state
          break
       }
@@ -612,7 +755,7 @@ export async function syncVtopWithChallenge(input: VtopLoginInput & { challengeI
       }
 
       if (/student|profile|attendance|timetable|course|semester|logout|sign out|menu|dashboard|academic|grade|welcome|home|main|faculty|registration/i.test(text)) {
-        console.log("[VTOP] Login confirmed. Workspace identified.")
+        console.log("[VTOP] Login confirmed via text identification.")
         break
       }
     }
@@ -647,13 +790,38 @@ export async function syncVtopWithChallenge(input: VtopLoginInput & { challengeI
 }
 
 async function scrapeProfile(page: Page): Promise<VtopProfile | undefined> {
+  // Quick scan of the dashboard header for name and registration number as a fallback
+  let dashboardName = ""
+  let dashboardRegNo = ""
+  try {
+    const frames = page.frames()
+    let headerText = ""
+    for (const frame of frames) {
+       const text = await frame.locator("#vtopHeader, .vtopHeader, .studentName").first().textContent({ timeout: 1000 }).catch(() => "")
+       if (text) {
+          headerText = text
+          break
+       }
+    }
+    
+    if (headerText) {
+      dashboardName = clean(headerText.match(/welcome\s+([^(\n-]+)/i)?.[1])
+      dashboardRegNo = clean(headerText.match(/\d{2}[A-Z]{3}\d{4}/i)?.[0])
+    }
+  } catch (e) {}
+
   // Prioritize "Your Credentials" which has a cleaner table layout, then fallback to the main profile
   await clickLikely(page, ["viewStudentCredentials", "StudentProfileAllView", "profile", "student profile"])
 
   const fullName =
     clean(await definitionValue(page, ["name", "student name", "full name"])) ||
-    clean(await page.locator("h1,h2,h3,.studentName,.profile-name").first().textContent({ timeout: 2000 }).catch(() => ""))
-  const registrationNumber = clean(await definitionValue(page, ["register number", "registration number", "reg no", "reg. no"]))
+    clean(await page.locator("h1,h2,h3,.studentName,.profile-name").first().textContent({ timeout: 2000 }).catch(() => "")) ||
+    dashboardName
+
+  const registrationNumber = 
+    clean(await definitionValue(page, ["register number", "registration number", "reg no", "reg. no"])) ||
+    dashboardRegNo
+
   const program = clean(await definitionValue(page, ["program", "programme", "degree"]))
   const branch = clean(await definitionValue(page, ["branch", "course", "specialization"]))
   const school = clean(await definitionValue(page, ["school", "school / centre", "centre"]))
@@ -685,16 +853,36 @@ async function scrapeProfile(page: Page): Promise<VtopProfile | undefined> {
 
 async function scrapeAttendance(page: Page): Promise<VtopAttendanceRecord[]> {
   await clickLikely(page, ["StudentAttendance", "attendance", "student attendance"])
-  const rows = await tableRows(page, ["attendance", "attended", "percentage"])
+  const rows = await tableRows(page, ["attendance", "attended", "percentage", "subject", "slot", "faculty"])
   return rows
     .map((row) => {
-      const percentage = parseNumber(row.find((cell) => /%|\d+\.\d+/.test(cell)) ?? "") ?? 0
-      const numbers = row.map((cell) => parseNumber(cell)).filter((value): value is number => typeof value === "number")
+      const percentageStr = row.find((cell) => cell.includes("%") || /^\d+(\.\d+)?$/.test(cell)) ?? ""
+      const percentage = parseNumber(percentageStr) ?? 0
+      
+      // Try to find attended and total classes.
+      // Often in VTOP Chennai they are formatted as "Attended / Total" in one cell or separate columns.
+      let attended = 0
+      let total = 0
+      
+      const ratioCell = row.find((cell) => cell.includes("/") && /\d/.test(cell))
+      if (ratioCell) {
+         const parts = ratioCell.split("/").map(p => parseNumber(p))
+         attended = parts[0] ?? 0
+         total = parts[1] ?? 0
+      } else {
+         const numbers = row.map((cell) => parseNumber(cell)).filter((value): value is number => typeof value === "number" && value <= 500)
+         // Heuristic: Attended and Total are often the two numbers appearing before the percentage
+         attended = numbers.at(-3) ?? 0
+         total = numbers.at(-2) ?? 0
+      }
+
       return {
-        courseCode: row.find((cell) => /^[A-Z]{2,}\d+/i.test(cell)) ?? "",
-        courseTitle: row.find((cell) => /[A-Za-z]{4,}/.test(cell) && !/attendance|total|attended/i.test(cell)) ?? "Course",
-        attended: numbers.at(-3) ?? 0,
-        total: numbers.at(-2) ?? 0,
+        courseCode: row.find((cell) => /^[A-Z]{2,}\d+[A-Z]?/i.test(cell)) ?? "",
+        courseTitle: row.find((cell) => /[A-Za-z]{4,}/.test(cell) && !/attendance|total|attended|course type|slot|faculty|regular/i.test(cell)) ?? "Course",
+        slot: row.find((cell) => /^[A-Z]\d[+-]?(\s*\+\s*[A-Z]\d[+-]?)*$/i.test(cell) || /^[A-Z][+-]?$/i.test(cell)),
+        faculty: row.find((cell) => /[A-Z]{3,}\s+[A-Z\s]+/.test(cell) && cell.length > 5 && !/course|slot|attendance|regular/i.test(cell)),
+        attended,
+        total,
         percentage,
         status: percentage >= 75 ? "On Track" : percentage > 0 ? "Needs Attention" : "Unknown",
       } satisfies VtopAttendanceRecord
@@ -732,12 +920,17 @@ async function scrapeMarks(page: Page): Promise<VtopMarkRecord[]> {
         console.log(`[VTOP-Scrape] Processing top ${recentSemesters.length} semesters to avoid timeout...`)
         
         for (const val of recentSemesters) {
+           console.log(`[VTOP-Scrape] Selecting semester: ${val}`)
            await select.selectOption(val)
-           // Wait for the AJAX call that populates the table based on selection
-           await page.waitForTimeout(1000)
+           // Wait for the AJAX call that populates the table based on selection.
+           // VTOP Chennai usually takes 1-2 seconds to refresh the table.
+           await page.waitForTimeout(2000)
            
-           const rows = await tableRows(page, ["marks", "assessment", "grade", "course"])
-           allRows = allRows.concat(rows)
+           const rows = await tableRows(page, ["marks", "assessment", "grade", "course", "subject", "score", "component"])
+           if (rows.length > 0) {
+              console.log(`[VTOP-Scrape] Scraped ${rows.length} mark rows for semester ${val}`)
+              allRows = allRows.concat(rows)
+           }
         }
         
         // If we found and processed a dropdown, break early so we don't try other frames unnecessarily
@@ -751,24 +944,36 @@ async function scrapeMarks(page: Page): Promise<VtopMarkRecord[]> {
   // Fallback: If no dropdown was found or it failed, try scraping the page directly
   // (In case VTOP reverts to a flat structure or pre-loads the current semester)
   if (allRows.length === 0) {
-      allRows = await tableRows(page, ["marks", "assessment", "grade", "course"])
+      allRows = await tableRows(page, ["marks", "assessment", "grade", "course", "subject", "score", "component"])
   }
 
   return allRows
-    .map((row) => ({
-      courseCode: row.find((cell) => /^[A-Z]{2,}\d+/i.test(cell)) ?? "",
-      courseTitle: row.find((cell) => /[A-Za-z]{4,}/.test(cell) && !/marks|grade|assessment/i.test(cell)) ?? "Course",
-      assessment: row.find((cell) => /cat|fat|quiz|lab|assignment|assessment|final/i.test(cell)) ?? "Assessment",
-      scored: parseNumber(row.find((cell) => /\d/.test(cell)) ?? ""),
-      max: parseNumber(row.find((cell) => /\/\s*\d+|max/i.test(cell)) ?? ""),
-      grade: row.find((cell) => /^[ABSCDENF][+-]?$/i.test(cell)),
-    }))
+    .map((row) => {
+      const scoreCell = row.find((cell) => /\d+\s*\/\s*\d+/.test(cell))
+      let scored = parseNumber(row.find((cell) => /\d+(\.\d+)?/.test(cell)) ?? "")
+      let max = parseNumber(row.find((cell) => /max|maximum|\/\s*\d+/i.test(cell)) ?? "")
+      
+      if (scoreCell) {
+         const parts = scoreCell.split("/").map(p => parseNumber(p))
+         scored = parts[0]
+         max = parts[1]
+      }
+
+      return {
+        courseCode: row.find((cell) => /^[A-Z]{2,}\d+/i.test(cell)) ?? "",
+        courseTitle: row.find((cell) => /[A-Za-z]{4,}/.test(cell) && !/marks|grade|assessment|scored|max/i.test(cell)) ?? "Course",
+        assessment: row.find((cell) => /cat|fat|quiz|lab|assignment|assessment|final|project|theory/i.test(cell)) ?? "Assessment",
+        scored,
+        max,
+        grade: row.find((cell) => /^[ABSCDENF][+-]?$/i.test(cell)),
+      }
+    })
     .filter((item) => item.courseCode || item.courseTitle !== "Course")
 }
 
 async function scrapeGpa(page: Page): Promise<VtopGpaRecord[]> {
   await clickLikely(page, ["StudentGradeHistory", "gpa", "cgpa", "grade history", "academic history"])
-  const rows = await tableRows(page, ["gpa", "cgpa", "credits", "semester"])
+  const rows = await tableRows(page, ["gpa", "cgpa", "credits", "semester", "effective gpa", "curriculum"])
   return rows
     .map((row) => ({
       semester: row.find((cell) => /semester|winter|fall|summer|\d/i.test(cell)) ?? "",
@@ -781,7 +986,7 @@ async function scrapeGpa(page: Page): Promise<VtopGpaRecord[]> {
 
 async function scrapeTimetable(page: Page): Promise<VtopTimetableEntry[]> {
   await clickLikely(page, ["StudentTimeTableChn", "StudentTimeTable", "timetable", "time table", "class schedule"])
-  const rows = await tableRows(page, ["slot", "room", "day", "time"])
+  const rows = await tableRows(page, ["slot", "room", "day", "time", "subject", "course title"])
   return rows
     .map((row) => ({
       day: row.find((cell) => /mon|tue|wed|thu|fri|sat|sun/i.test(cell)) ?? "",
@@ -796,7 +1001,7 @@ async function scrapeTimetable(page: Page): Promise<VtopTimetableEntry[]> {
 
 async function scrapeExams(page: Page): Promise<VtopExamEntry[]> {
   await clickLikely(page, ["StudExamSchedule", "exam schedule", "examination", "exam"])
-  const rows = await tableRows(page, ["exam", "venue", "date", "course"])
+  const rows = await tableRows(page, ["exam", "venue", "date", "course", "subject", "session", "reporting"])
   return rows
     .map((row) => ({
       courseCode: row.find((cell) => /^[A-Z]{2,}\d+/i.test(cell)) ?? "",
@@ -811,7 +1016,7 @@ async function scrapeExams(page: Page): Promise<VtopExamEntry[]> {
 
 async function scrapeFees(page: Page): Promise<VtopFeeRecord[]> {
   await clickLikely(page, ["getFeesIntimation", "Payments", "fee", "financial"])
-  const rows = await tableRows(page, ["fee", "paid", "balance", "amount"])
+  const rows = await tableRows(page, ["fee", "paid", "balance", "amount", "transaction", "payment"])
   return rows
     .map((row) => {
       const amount = parseNumber(row.find((cell) => /₹|rs|inr|amount/i.test(cell)) ?? row.find((cell) => /\d/.test(cell)) ?? "")
@@ -836,7 +1041,7 @@ async function scrapeFees(page: Page): Promise<VtopFeeRecord[]> {
 
 async function scrapeHistory(page: Page): Promise<VtopAcademicHistoryRecord[]> {
   await clickLikely(page, ["StudentGradeHistory", "academic history", "transcript"])
-  const rows = await tableRows(page, ["semester", "grade", "credits", "result"])
+  const rows = await tableRows(page, ["semester", "grade", "credits", "result", "subject", "course", "effective"])
   return rows
     .map((row) => ({
       semester: row.find((cell) => /semester|winter|fall|summer|\d/i.test(cell)) ?? "",
@@ -859,10 +1064,13 @@ async function scrapeAll(page: Page): Promise<VtopSyncedData> {
   try {
     const dashboardText = await getAllPageText(page)
     // Looking for patterns like "CGPA : 8.9" or "Credits Earned : 120"
-    const cgpaMatch = dashboardText.match(/cgpa.*?(\d+\.\d+)/i)
-    if (cgpaMatch) dashboardCgpa = parseFloat(cgpaMatch[1])
+    const cgpaMatch = dashboardText.match(/(?:CGPA|Cumulative\s*Grade\s*Point\s*Average)\s*[:\-]?\s*(\d+(?:\.\d+)?)/i)
+    if (cgpaMatch) {
+       const val = parseFloat(cgpaMatch[1])
+       if (val <= 10) dashboardCgpa = val
+    }
     
-    const creditsMatch = dashboardText.match(/(?:credit|earned).*?(\d+)/i)
+    const creditsMatch = dashboardText.match(/(?:Credits\s*Earned|Total\s*Credits|Credits\s*Registered|Total\s*Credit)\s*[:\-]?\s*(\d+)/i)
     if (creditsMatch) dashboardCredits = parseInt(creditsMatch[1], 10)
     
     console.log(`[VTOP-Scrape] Dashboard quick-scan: CGPA=${dashboardCgpa}, Credits=${dashboardCredits}`)
@@ -947,7 +1155,15 @@ export async function syncVtopWithCookies(browserCookies: BrowserCookie[]) {
     await page.goto(`${VTOP_CHENNAI_ORIGIN}/vtop/content`, { waitUntil: "domcontentloaded", timeout: 20_000 })
     await page.waitForTimeout(2000)
     
-    const isDashboard = await page.locator('#authorizedIDX, .VITEmblem, #vtopHeader').first().count() > 0
+    let isDashboard = false
+    const frames = page.frames()
+    for (const frame of frames) {
+       if (await frame.locator('#authorizedIDX, .VITEmblem, #vtopHeader').first().count() > 0) {
+          isDashboard = true
+          break
+       }
+    }
+
     if (!isDashboard) {
       throw new VtopScraperError("SESSION_EXPIRED", "Your VTOP session has expired. Reconnect to continue syncing.")
     }
