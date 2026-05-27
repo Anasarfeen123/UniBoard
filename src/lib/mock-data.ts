@@ -1,0 +1,87 @@
+import { Student, AcademicRecord, FeeRecord } from "@/types";
+
+export const currentUser: Student = {
+  id: "1",
+  name: "Aarav Raman",
+  rollNo: "24BCE1001",
+  department: "B.Tech Computer Science",
+  semester: 4,
+  year: 2,
+  email: "aarav.raman2024@vitstudent.ac.in",
+  gpa: 3.82,
+  cgpa: 3.75,
+  attendance: 94.2,
+  feeStatus: "Paid",
+};
+
+export const mockAcademicRecords: AcademicRecord[] = [
+  {
+    id: "rec1",
+    studentId: "1",
+    subjectCode: "CSE2001",
+    subjectName: "Data Structures",
+    credits: 4,
+    testType: "Final",
+    maxMarks: 100,
+    score: 92,
+    weightage: 100,
+    grade: "A",
+    semester: 4,
+  },
+  {
+    id: "rec2",
+    studentId: "1",
+    subjectCode: "CSE2002",
+    subjectName: "Algorithms",
+    credits: 4,
+    testType: "Final",
+    maxMarks: 100,
+    score: 88,
+    weightage: 100,
+    grade: "A-",
+    semester: 4,
+  },
+  {
+    id: "rec3",
+    studentId: "1",
+    subjectCode: "CSE2003",
+    subjectName: "Operating Systems",
+    credits: 3,
+    testType: "Internal",
+    maxMarks: 50,
+    score: 46,
+    weightage: 100,
+    grade: "A",
+    semester: 4,
+  },
+];
+
+export const mockFeeRecords: FeeRecord[] = [
+  {
+    id: "fee1",
+    studentId: "1",
+    category: "Tuition (Sem 4)",
+    amount: 198000,
+    paid: 198000,
+    dueDate: "2024-05-15",
+    status: "Paid",
+  },
+  {
+    id: "fee2",
+    studentId: "1",
+    category: "Library Fee",
+    amount: 3000,
+    paid: 3000,
+    dueDate: "2024-05-15",
+    status: "Paid",
+  },
+  {
+    id: "fee3",
+    studentId: "1",
+    category: "Exam Fee",
+    amount: 6500,
+    paid: 6500,
+    dueDate: "2024-06-01",
+    status: "Paid",
+  },
+];
