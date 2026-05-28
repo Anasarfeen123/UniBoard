@@ -33,12 +33,17 @@ export async function POST() {
 
   try {
     const result = session.password
-      ? await syncVtopWithCredentials({ username: session.username, password: session.password })
-      : await syncVtopWithCookies(session.browserCookies)
+      ? await syncVtopWithCredentials({
+          username: session.username,
+          password: session.password,
+          semesterId: session.selectedSemesterId,
+        })
+      : await syncVtopWithCookies(session.browserCookies, { semesterId: session.selectedSemesterId })
 
     const nextSession: StoredVtopSession = {
       ...session,
       browserCookies: result.browserCookies,
+      selectedSemesterId: result.data.selectedSemesterId ?? session.selectedSemesterId,
       lastSyncedAt: result.data.syncedAt,
       sessionExpiresAt: new Date(Date.now() + 1000 * 60 * 60 * 8).toISOString(),
     }

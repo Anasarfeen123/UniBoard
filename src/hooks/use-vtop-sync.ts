@@ -5,6 +5,7 @@ import type { VtopApiResponse, VtopConnectionState, VtopSyncedData } from "@/lib
 
 const DATA_KEY = "uniboard.vtop.data"
 const PREFS_KEY = "uniboard.vtop.syncPrefs"
+const DATA_EVENT = "uniboard:vtop-data-changed"
 
 const defaultState: VtopConnectionState = {
   connected: false,
@@ -41,8 +42,10 @@ function readStoredData() {
   }
 }
 
-function writeStoredData(data: VtopSyncedData) {
+export function writeStoredVtopData(data: VtopSyncedData) {
+  if (typeof window === "undefined") return
   window.localStorage.setItem(DATA_KEY, JSON.stringify(data))
+  window.dispatchEvent(new Event(DATA_EVENT))
 }
 
 function readPrefs() {
@@ -63,6 +66,7 @@ export function writeVtopPrefs(prefs: SyncPreference) {
 export function clearStoredVtopData() {
   if (typeof window === "undefined") return
   window.localStorage.removeItem(DATA_KEY)
+  window.dispatchEvent(new Event(DATA_EVENT))
 }
 
 export function useVtopSync(options?: { autoRefreshMs?: number }) {
@@ -81,7 +85,7 @@ export function useVtopSync(options?: { autoRefreshMs?: number }) {
       setError(undefined)
       if (payload.data) {
         setData(payload.data)
-        writeStoredData(payload.data)
+        writeStoredVtopData(payload.data)
       }
     } else {
       setError(payload)
@@ -159,6 +163,20 @@ export function useVtopSync(options?: { autoRefreshMs?: number }) {
     const timer = window.setTimeout(() => void refreshStatus(), 0)
     return () => window.clearTimeout(timer)
   }, [refreshStatus])
+
+  React.useEffect(() => {
+    function syncFromStorage(event?: StorageEvent | Event) {
+      if (event instanceof StorageEvent && event.key !== DATA_KEY) return
+      setData(readStoredData())
+    }
+
+    window.addEventListener(DATA_EVENT, syncFromStorage)
+    window.addEventListener("storage", syncFromStorage)
+    return () => {
+      window.removeEventListener(DATA_EVENT, syncFromStorage)
+      window.removeEventListener("storage", syncFromStorage)
+    }
+  }, [])
 
   React.useEffect(() => {
     if (!options?.autoRefreshMs || !state.connected) return

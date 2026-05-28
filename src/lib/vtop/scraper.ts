@@ -31,6 +31,16 @@ type LoginChallenge = {
 export type VtopLoginInput = {
   username: string
   password: string
+  semesterId?: string
+}
+
+type VtopScrapeOptions = {
+  semesterId?: string
+}
+
+type VtopDirectContext = {
+  authorizedID: string
+  csrf: string
 }
 
 const browserLaunchOptions = {
@@ -82,6 +92,419 @@ function clean(value?: string | null) {
 function parseNumber(value: string) {
   const match = value.replace(/,/g, "").match(/-?\d+(\.\d+)?/)
   return match ? Number(match[0]) : undefined
+}
+
+function normalizeSemesterId(value?: string) {
+  const semesterId = clean(value).toUpperCase()
+  return /^CH\d{8,}$/i.test(semesterId) ? semesterId : undefined
+}
+
+function isCourseCode(value?: string) {
+  return /^[A-Z]{2,}\d+[A-Z]?(?:\s*[A-Z0-9-]+)?$/i.test(clean(value))
+}
+
+function isGrade(value?: string) {
+  return /^(?:S|A|B|C|D|E|F|N|P)(?:\+|-)?$/i.test(clean(value))
+}
+
+function firstText(row: string[], predicate: (cell: string, index: number) => boolean) {
+  return row.find((cell, index) => predicate(clean(cell), index))
+}
+
+function gradePoint(grade?: string) {
+  switch (clean(grade).toUpperCase()) {
+    case "S":
+      return 10
+    case "A":
+      return 9
+    case "B":
+      return 8
+    case "C":
+      return 7
+    case "D":
+      return 6
+    case "E":
+      return 5
+    case "F":
+    case "N":
+      return 0
+    default:
+      return undefined
+  }
+}
+
+function computeGpaFromHistory(history: VtopAcademicHistoryRecord[]): VtopGpaRecord[] {
+  const graded = history
+    .map((item) => ({ ...item, points: gradePoint(item.grade) }))
+    .filter((item): item is VtopAcademicHistoryRecord & { points: number; credits: number } => {
+      return typeof item.points === "number" && typeof item.credits === "number" && item.credits > 0
+    })
+
+  if (!graded.length) return []
+
+  const totalCredits = graded.reduce((sum, item) => sum + item.credits, 0)
+  const weightedPoints = graded.reduce((sum, item) => sum + item.credits * item.points, 0)
+  const cgpa = totalCredits ? weightedPoints / totalCredits : undefined
+
+  const semesterGroups = new Map<string, typeof graded>()
+  for (const item of graded) {
+    if (!item.semester) continue
+    semesterGroups.set(item.semester, [...(semesterGroups.get(item.semester) ?? []), item])
+  }
+
+  const semesterRecords = Array.from(semesterGroups.entries()).map(([semester, items]) => {
+    const credits = items.reduce((sum, item) => sum + item.credits, 0)
+    const points = items.reduce((sum, item) => sum + item.credits * item.points, 0)
+    return {
+      semester,
+      gpa: credits ? points / credits : undefined,
+      credits,
+    }
+  })
+
+  return [
+    {
+      semester: "Cumulative",
+      cgpa,
+      credits: totalCredits,
+    },
+    ...semesterRecords,
+  ]
+}
+
+async function getDirectContext(page: Page): Promise<VtopDirectContext | undefined> {
+  for (const frame of page.frames()) {
+    const context = await frame
+      .evaluate(() => {
+        const doc = document
+        const parentDoc = window.parent?.document
+        const bySelector = (root: Document, selector: string) =>
+          (root.querySelector(selector) as HTMLInputElement | null)?.value ?? ""
+
+        return {
+          authorizedID:
+            bySelector(doc, "#authorizedID") ||
+            bySelector(doc, "#authorizedIDX") ||
+            bySelector(doc, 'input[name="authorizedID"]') ||
+            bySelector(doc, 'input[name="authorizedid"]') ||
+            bySelector(parentDoc, "#authorizedID") ||
+            bySelector(parentDoc, "#authorizedIDX") ||
+            bySelector(parentDoc, 'input[name="authorizedID"]') ||
+            bySelector(parentDoc, 'input[name="authorizedid"]'),
+          csrf:
+            bySelector(doc, 'input[name="_csrf"]') ||
+            bySelector(parentDoc, 'input[name="_csrf"]') ||
+            (doc.querySelector('meta[name="_csrf"]') as HTMLMetaElement | null)?.content ||
+            (parentDoc.querySelector('meta[name="_csrf"]') as HTMLMetaElement | null)?.content ||
+            "",
+        }
+      })
+      .catch(() => undefined)
+
+    if (context?.authorizedID && context.csrf) return context
+  }
+}
+
+async function postVtopHtml(page: Page, endpoint: string, fields: Record<string, string | undefined>) {
+  const context = await getDirectContext(page)
+  if (!context) return ""
+
+  return page.evaluate(
+    async ({ endpoint, fields, context }) => {
+      const payload = new URLSearchParams()
+      payload.set("authorizedID", context.authorizedID)
+      payload.set("_csrf", context.csrf)
+      for (const [key, value] of Object.entries(fields)) {
+        if (value !== undefined) payload.set(key, value)
+      }
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: payload.toString(),
+        credentials: "include",
+      })
+
+      return response.text()
+    },
+    { endpoint, fields, context },
+  )
+}
+
+async function semesterValues(page: Page) {
+  const values: string[] = []
+  for (const frame of page.frames()) {
+    const frameValues = await frame
+      .locator("select option")
+      .evaluateAll((options) =>
+        options
+          .map((option) => ({
+            value: (option as HTMLOptionElement).value.trim(),
+            label: option.textContent?.replace(/\s+/g, " ").trim() ?? "",
+          }))
+          .filter((option) => option.value && /^CH\d{6,}/i.test(option.value) && !/choose|select/i.test(option.label))
+          .map((option) => option.value),
+      )
+      .catch(() => [] as string[])
+    values.push(...frameValues)
+  }
+
+  return Array.from(new Set(values))
+}
+
+async function selectedSemesterValues(page: Page, options?: VtopScrapeOptions) {
+  const selected = normalizeSemesterId(options?.semesterId)
+  if (selected) return [selected]
+  return semesterValues(page)
+}
+
+async function scrapeMarksDirect(page: Page, semesterIds: string[]): Promise<VtopMarkRecord[]> {
+  const records: VtopMarkRecord[] = []
+
+  for (const semesterId of semesterIds) {
+    const html = await postVtopHtml(page, "/vtop/examinations/doStudentMarkView", {
+      semesterSubId: semesterId,
+      x: Date.now().toString(),
+    }).catch(() => "")
+
+    if (!html) continue
+
+    const semesterRecords = await page.evaluate((html) => {
+      const clean = (value?: string | null) => value?.replace(/\s+/g, " ").trim() ?? ""
+      const doc = new DOMParser().parseFromString(html, "text/html")
+      const rows = Array.from(doc.querySelectorAll("table.customTable > tbody > tr.tableContent"))
+      const output: Array<{
+        courseCode: string
+        courseTitle: string
+        assessment: string
+        scored?: number
+        max?: number
+        grade?: string
+      }> = []
+
+      for (let index = 0; index < rows.length; index += 1) {
+        const cols = Array.from(rows[index].querySelectorAll(":scope > td"))
+        if (cols.length < 9) continue
+
+        const courseCode = clean(cols[2]?.textContent)
+        const courseTitle = clean(cols[3]?.textContent)
+        const nestedRow = rows[index + 1]
+        const assessments = Array.from(nestedRow?.querySelectorAll("table.customTable-level1 > tbody > tr.tableContent-level1") ?? [])
+
+        for (const assessmentRow of assessments) {
+          const cells = Array.from(assessmentRow.querySelectorAll("td"))
+          const valueAt = (cellIndex: number) => clean(cells[cellIndex]?.querySelector("output")?.textContent ?? cells[cellIndex]?.textContent)
+          const toNumber = (value: string) => {
+            const match = value.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/)
+            return match ? Number(match[0]) : undefined
+          }
+
+          output.push({
+            courseCode,
+            courseTitle,
+            assessment: valueAt(1) || "Assessment",
+            max: toNumber(valueAt(2)),
+            scored: toNumber(valueAt(5)),
+            grade: undefined,
+          })
+        }
+      }
+
+      return output
+    }, html)
+
+    records.push(...semesterRecords)
+  }
+
+  return records
+}
+
+async function scrapeGradeViewDirect(page: Page, semesterIds: string[]) {
+  const marks: VtopMarkRecord[] = []
+  const history: VtopAcademicHistoryRecord[] = []
+  const gpa: VtopGpaRecord[] = []
+
+  for (const semesterId of semesterIds) {
+    const html = await postVtopHtml(page, "/vtop/examinations/examGradeView/doStudentGradeView", {
+      semesterSubId: semesterId,
+      x: Date.now().toString(),
+    }).catch(() => "")
+
+    if (!html) continue
+
+    const parsed = await page.evaluate(
+      ({ html, semesterId }) => {
+        const clean = (value?: string | null) => value?.replace(/\s+/g, " ").trim() ?? ""
+        const toNumber = (value: string) => {
+          const match = value.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/)
+          return match ? Number(match[0]) : undefined
+        }
+        const doc = new DOMParser().parseFromString(html, "text/html")
+        const rows = Array.from(doc.querySelectorAll("table.table-bordered tr")).slice(2)
+        const records: Array<{
+          courseCode: string
+          courseTitle: string
+          scored?: number
+          grade?: string
+          credits?: number
+        }> = []
+        let semesterGpa: number | undefined
+
+        for (const row of rows) {
+          if (row.getAttribute("align") === "center") {
+            const match = clean(row.textContent).match(/GPA\s*:\s*([\d.]+)/i)
+            if (match) semesterGpa = Number(match[1])
+            continue
+          }
+
+          const cols = Array.from(row.querySelectorAll("td"))
+          if (cols.length < 11) continue
+
+          records.push({
+            courseCode: clean(cols[1]?.textContent),
+            courseTitle: clean(cols[2]?.textContent),
+            credits: toNumber(clean(cols[5]?.textContent)),
+            scored: toNumber(clean(cols[9]?.textContent)),
+            grade: clean(cols[10]?.textContent) || undefined,
+          })
+        }
+
+        return { semesterId, semesterGpa, records }
+      },
+      { html, semesterId },
+    )
+
+    if (parsed.semesterGpa) {
+      const credits = parsed.records.reduce((sum, item) => sum + (item.credits ?? 0), 0)
+      gpa.push({ semester: semesterId, gpa: parsed.semesterGpa, credits: credits || undefined })
+    }
+
+    for (const record of parsed.records) {
+      history.push({
+        semester: semesterId,
+        courseCode: record.courseCode,
+        courseTitle: record.courseTitle,
+        credits: record.credits,
+        grade: record.grade,
+      })
+      marks.push({
+        courseCode: record.courseCode,
+        courseTitle: record.courseTitle,
+        assessment: `${semesterId} final grade`,
+        scored: record.scored,
+        grade: record.grade,
+      })
+    }
+  }
+
+  return { marks, history, gpa }
+}
+
+async function scrapeCreditsDirect(page: Page): Promise<VtopGpaRecord | undefined> {
+  const html = await postVtopHtml(page, "/vtop/get/dashboard/current/cgpa/credits", {
+    x: Date.now().toString(),
+  }).catch(() => "")
+  if (!html) return undefined
+
+  return page.evaluate((html) => {
+    const clean = (value?: string | null) => value?.replace(/\s+/g, " ").trim() ?? ""
+    const toCgpa = (value: string) => {
+      const decimals = Array.from(value.replace(/,/g, "").matchAll(/\b\d+\.\d+\b/g))
+        .map((match) => Number(match[0]))
+        .filter((number) => number > 0 && number <= 10)
+      if (decimals.length) return decimals.at(-1)
+
+      const numbers = Array.from(value.replace(/,/g, "").matchAll(/\b\d+\b/g))
+        .map((match) => Number(match[0]))
+        .filter((number) => number > 0 && number <= 10)
+      return numbers.at(-1)
+    }
+    const toCredits = (value: string) => {
+      const numbers = Array.from(value.replace(/,/g, "").matchAll(/\b\d+(?:\.\d+)?\b/g))
+        .map((match) => Number(match[0]))
+        .filter((number) => number > 0 && number <= 300)
+      return numbers.at(-1)
+    }
+    const doc = new DOMParser().parseFromString(html, "text/html")
+    let credits: number | undefined
+    let cgpa: number | undefined
+
+    for (const item of Array.from(doc.querySelectorAll(".list-group-item"))) {
+      const label = clean(item.querySelector("span.card-title")?.textContent)
+      const value = clean(item.querySelector("span.fontcolor3")?.textContent) || clean(item.textContent)
+      if (/Earned Credits/i.test(label) || /Earned Credits/i.test(value)) credits = toCredits(value)
+      if (/Current CGPA/i.test(label) || /Current CGPA/i.test(value)) cgpa = toCgpa(value)
+    }
+
+    return cgpa || credits ? { semester: "Current", cgpa, credits } : undefined
+  }, html)
+}
+
+async function scrapeAttendanceDirect(page: Page, semesterId?: string): Promise<VtopAttendanceRecord[]> {
+  if (!semesterId) return []
+
+  const html = await postVtopHtml(page, "/vtop/processViewStudentAttendance", {
+    semesterSubId: semesterId,
+    x: Date.now().toString(),
+  }).catch(() => "")
+  if (!html) return []
+
+  const records = await page.evaluate((html) => {
+    const clean = (value?: string | null) => value?.replace(/\s+/g, " ").trim() ?? ""
+    const toNumber = (value: string) => {
+      const match = value.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/)
+      return match ? Number(match[0]) : 0
+    }
+    const doc = new DOMParser().parseFromString(html, "text/html")
+
+    return Array.from(doc.querySelectorAll("#getStudentDetails table tbody tr"))
+      .flatMap((row) => {
+        const cols = Array.from(row.querySelectorAll("td"))
+        if (cols.length < 12) return []
+
+        const attended = toNumber(clean(cols[9]?.textContent))
+        const total = toNumber(clean(cols[10]?.textContent))
+        const percentage = toNumber(clean(cols[11]?.textContent))
+
+        return [{
+          courseCode: clean(cols[1]?.textContent),
+          courseTitle: clean(cols[2]?.textContent) || "Course",
+          slot: clean(cols[4]?.textContent) || undefined,
+          faculty: clean(cols[5]?.textContent) || undefined,
+          attended,
+          total,
+          percentage,
+          status: percentage >= 75 ? "On Track" : percentage > 0 ? "Needs Attention" : "Unknown",
+        }]
+      })
+      .filter((item) => item.courseCode || item.courseTitle)
+  }, html)
+
+  return records as VtopAttendanceRecord[]
+}
+
+async function fetchProfilePhoto(page: Page, registrationNumber: string) {
+  const id = clean(registrationNumber)
+  if (!id) return undefined
+
+  return page
+    .evaluate(async (id) => {
+      const response = await fetch(`/vtop/users/image/?id=${encodeURIComponent(id)}`, {
+        credentials: "include",
+      })
+      if (!response.ok) return undefined
+
+      const contentType = response.headers.get("content-type") || "image/jpeg"
+      if (!contentType.startsWith("image/")) return undefined
+
+      const buffer = await response.arrayBuffer()
+      let binary = ""
+      for (const byte of new Uint8Array(buffer)) binary += String.fromCharCode(byte)
+      return `data:${contentType};base64,${btoa(binary)}`
+    }, id)
+    .catch(() => undefined)
 }
 
 function classifyLoginFailure(text: string) {
@@ -781,7 +1204,7 @@ export async function syncVtopWithChallenge(input: VtopLoginInput & { challengeI
     }
 
     console.log("[VTOP] Login verified. Proceeding to scrape data...")
-    const data = await scrapeAll(page)
+    const data = await scrapeAll(page, { semesterId: input.semesterId })
     const browserCookies = await challenge.context.cookies()
     return { data, browserCookies }
   } catch (error) {
@@ -829,11 +1252,13 @@ async function scrapeProfile(page: Page): Promise<VtopProfile | undefined> {
   const semester = clean(await definitionValue(page, ["semester", "current semester"]))
   const email = clean(await definitionValue(page, ["email", "email id", "vit email"]))
   const academicStatus = clean(await definitionValue(page, ["status", "academic status"])) || "Active"
-  const profilePhoto = await page
-    .locator('img[src*="photo" i], img[src*="profile" i], img[src*="image" i]')
-    .first()
-    .evaluate((img: HTMLImageElement) => img.currentSrc || img.src)
-    .catch(() => undefined)
+  const profilePhoto =
+    (await fetchProfilePhoto(page, registrationNumber)) ??
+    (await page
+      .locator('img[src*="photo" i], img[src*="profile" i], img[src*="image" i], img[src*="/users/image/" i]')
+      .first()
+      .evaluate((img: HTMLImageElement) => img.currentSrc || img.src)
+      .catch(() => undefined))
 
   if (!fullName && !registrationNumber) return undefined
 
@@ -851,8 +1276,11 @@ async function scrapeProfile(page: Page): Promise<VtopProfile | undefined> {
   }
 }
 
-async function scrapeAttendance(page: Page): Promise<VtopAttendanceRecord[]> {
+async function scrapeAttendance(page: Page, options?: VtopScrapeOptions): Promise<VtopAttendanceRecord[]> {
   await clickLikely(page, ["StudentAttendance", "attendance", "student attendance"])
+  const directRows = await scrapeAttendanceDirect(page, (await selectedSemesterValues(page, options))[0])
+  if (directRows.length > 0) return directRows
+
   const rows = await tableRows(page, ["attendance", "attended", "percentage", "subject", "slot", "faculty"])
   return rows
     .map((row) => {
@@ -890,10 +1318,16 @@ async function scrapeAttendance(page: Page): Promise<VtopAttendanceRecord[]> {
     .filter((item) => item.courseCode || item.courseTitle !== "Course")
 }
 
-async function scrapeMarks(page: Page): Promise<VtopMarkRecord[]> {
+async function scrapeMarks(page: Page, options?: VtopScrapeOptions): Promise<VtopMarkRecord[]> {
   await clickLikely(page, ["StudentMarkView", "marks", "grade", "course page"])
   
   let allRows: string[][] = []
+  const semesters = await selectedSemesterValues(page, options)
+  const directMarks = await scrapeMarksDirect(page, semesters.slice(0, options?.semesterId ? 1 : 4))
+  if (directMarks.length > 0) return directMarks
+
+  const gradeViewMarks = await scrapeGradeViewDirect(page, semesters.slice(0, options?.semesterId ? 1 : 8))
+  if (gradeViewMarks.marks.length > 0) return gradeViewMarks.marks
   
   // VTOP marks page requires selecting a semester from a dropdown first
   try {
@@ -971,16 +1405,37 @@ async function scrapeMarks(page: Page): Promise<VtopMarkRecord[]> {
     .filter((item) => item.courseCode || item.courseTitle !== "Course")
 }
 
-async function scrapeGpa(page: Page): Promise<VtopGpaRecord[]> {
+async function scrapeGpa(page: Page, options?: VtopScrapeOptions): Promise<VtopGpaRecord[]> {
+  const current = await scrapeCreditsDirect(page)
   await clickLikely(page, ["StudentGradeHistory", "gpa", "cgpa", "grade history", "academic history"])
+  const semesterIds = await selectedSemesterValues(page, options)
+  const direct = await scrapeGradeViewDirect(page, semesterIds.slice(0, options?.semesterId ? 1 : 8))
+  if (direct.gpa.length > 0 || current) {
+    return [current, ...direct.gpa].filter((item): item is VtopGpaRecord => Boolean(item))
+  }
+
   const rows = await tableRows(page, ["gpa", "cgpa", "credits", "semester", "effective gpa", "curriculum"])
   return rows
-    .map((row) => ({
-      semester: row.find((cell) => /semester|winter|fall|summer|\d/i.test(cell)) ?? "",
-      gpa: parseNumber(row.find((cell) => /gpa/i.test(cell)) ?? ""),
-      cgpa: parseNumber(row.find((cell) => /cgpa/i.test(cell)) ?? ""),
-      credits: parseNumber(row.find((cell) => /credit/i.test(cell)) ?? ""),
-    }))
+    .filter((row) => !row.some((cell) => isCourseCode(cell)))
+    .map((row) => {
+      const semester =
+        firstText(row, (cell) => /semester|winter|fall|summer|interim|trimester/i.test(cell)) ??
+        firstText(row, (cell) => /[A-Z]{2}\d{6,}/i.test(cell)) ??
+        firstText(row, (cell, index) => index > 0 && /\d/.test(cell) && !isCourseCode(cell)) ??
+        ""
+      const numbers = row
+        .map((cell) => parseNumber(cell))
+        .filter((value): value is number => typeof value === "number")
+      const gradePoints = numbers.filter((value) => value > 0 && value <= 10)
+      const creditLike = numbers.filter((value) => value > 10 && value <= 300)
+
+      return {
+        semester,
+        gpa: parseNumber(row.find((cell) => /gpa/i.test(cell)) ?? "") ?? gradePoints.at(-2) ?? gradePoints.at(-1),
+        cgpa: parseNumber(row.find((cell) => /cgpa/i.test(cell)) ?? "") ?? gradePoints.at(-1),
+        credits: parseNumber(row.find((cell) => /credit/i.test(cell)) ?? "") ?? creditLike.at(-1),
+      }
+    })
     .filter((item) => item.semester || item.gpa || item.cgpa)
 }
 
@@ -1039,24 +1494,51 @@ async function scrapeFees(page: Page): Promise<VtopFeeRecord[]> {
     .filter((item) => item.label !== "Fee" || item.amount)
 }
 
-async function scrapeHistory(page: Page): Promise<VtopAcademicHistoryRecord[]> {
+async function scrapeHistory(page: Page, options?: VtopScrapeOptions): Promise<VtopAcademicHistoryRecord[]> {
   await clickLikely(page, ["StudentGradeHistory", "academic history", "transcript"])
+  const semesterIds = await selectedSemesterValues(page, options)
+  const direct = await scrapeGradeViewDirect(page, semesterIds.slice(0, options?.semesterId ? 1 : 8))
+  if (direct.history.length > 0) return direct.history
+
   const rows = await tableRows(page, ["semester", "grade", "credits", "result", "subject", "course", "effective"])
   return rows
-    .map((row) => ({
-      semester: row.find((cell) => /semester|winter|fall|summer|\d/i.test(cell)) ?? "",
-      courseCode: row.find((cell) => /^[A-Z]{2,}\d+/i.test(cell)),
-      courseTitle: row.find((cell) => /[A-Za-z]{4,}/.test(cell) && !/semester|grade|result/i.test(cell)),
-      credits: parseNumber(row.find((cell) => /credit|\d/.test(cell)) ?? ""),
-      grade: row.find((cell) => /^[ABSCDENF][+-]?$/i.test(cell)),
-      result: row.find((cell) => /pass|fail|completed/i.test(cell)),
-    }))
-    .filter((item) => item.semester || item.courseCode)
+    .map((row) => {
+      const courseIndex = row.findIndex((cell) => isCourseCode(cell))
+      const semester =
+        firstText(row, (cell) => /semester|winter|fall|summer|interim|trimester/i.test(cell)) ??
+        firstText(row, (cell) => /[A-Z]{2}\d{6,}/i.test(cell)) ??
+        ""
+      const courseCode = courseIndex >= 0 ? clean(row[courseIndex]) : undefined
+      const titleCandidates = row.filter((cell, index) => {
+        const value = clean(cell)
+        return (
+          index !== courseIndex &&
+          /[A-Za-z]{4,}/.test(value) &&
+          !/semester|grade|result|pass|fail|completed|credits?|course\s*code|course\s*title|type|sl\.?\s*no/i.test(value) &&
+          !isGrade(value)
+        )
+      })
+      const numbersAfterCourse = row
+        .slice(Math.max(courseIndex + 1, 0))
+        .map((cell) => parseNumber(cell))
+        .filter((value): value is number => typeof value === "number" && value > 0 && value <= 30)
+
+      return {
+        semester,
+        courseCode,
+        courseTitle: titleCandidates.at(0),
+        credits: parseNumber(row.find((cell) => /credit/i.test(cell)) ?? "") ?? numbersAfterCourse.at(-1),
+        grade: row.find((cell) => isGrade(cell)),
+        result: row.find((cell) => /pass|fail|completed/i.test(cell)),
+      }
+    })
+    .filter((item) => item.semester || item.courseCode || item.courseTitle || item.grade)
 }
 
-async function scrapeAll(page: Page): Promise<VtopSyncedData> {
+async function scrapeAll(page: Page, options?: VtopScrapeOptions): Promise<VtopSyncedData> {
   const syncedAt = new Date().toISOString()
   const unavailableAreas: VtopSyncedData["unavailableAreas"] = []
+  const selectedSemesterId = normalizeSemesterId(options?.semesterId)
 
   // Try to grab CGPA directly from the dashboard before we navigate away
   let dashboardCgpa: number | undefined
@@ -1091,11 +1573,11 @@ async function scrapeAll(page: Page): Promise<VtopSyncedData> {
   }
 
   const profile = await attempt("profile", () => scrapeProfile(page), undefined)
-  const attendance = await attempt("attendance", () => scrapeAttendance(page), [])
-  const marks = await attempt("marks", () => scrapeMarks(page), [])
+  const attendance = await attempt("attendance", () => scrapeAttendance(page, options), [])
+  const marks = await attempt("marks", () => scrapeMarks(page, options), [])
   
   // Try deep dive first, fallback to dashboard scan
-  let gpa = await attempt("gpa", () => scrapeGpa(page), [])
+  let gpa = await attempt("gpa", () => scrapeGpa(page, options), [])
   if (gpa.length === 0 && dashboardCgpa) {
       gpa = [{ semester: "Current", gpa: dashboardCgpa, cgpa: dashboardCgpa, credits: dashboardCredits }]
       // Remove from unavailable if we salvaged it from the dashboard
@@ -1103,15 +1585,24 @@ async function scrapeAll(page: Page): Promise<VtopSyncedData> {
       if (index > -1) unavailableAreas.splice(index, 1);
   }
   
+  const academicHistory = await attempt("history", () => scrapeHistory(page, options), [])
+  if (gpa.length === 0 && academicHistory.length > 0) {
+    gpa = computeGpaFromHistory(academicHistory)
+    if (gpa.length > 0) {
+      const index = unavailableAreas.indexOf("gpa")
+      if (index > -1) unavailableAreas.splice(index, 1)
+    }
+  }
+
   const timetable = await attempt("timetable", () => scrapeTimetable(page), [])
   const exams = await attempt("exams", () => scrapeExams(page), [])
   const fees = await attempt("fees", () => scrapeFees(page), [])
-  const academicHistory = await attempt("history", () => scrapeHistory(page), [])
 
   return {
     campus: "VTOP Chennai",
     source: VTOP_CHENNAI_ORIGIN,
     syncedAt,
+    selectedSemesterId,
     profile,
     attendance,
     marks,
@@ -1132,7 +1623,7 @@ export async function syncVtopWithCredentials(input: VtopLoginInput) {
   try {
     const page = await context.newPage()
     await login(page, input)
-    const data = await scrapeAll(page)
+    const data = await scrapeAll(page, { semesterId: input.semesterId })
     const browserCookies = await context.cookies()
     return { data, browserCookies }
   } finally {
@@ -1140,7 +1631,7 @@ export async function syncVtopWithCredentials(input: VtopLoginInput) {
   }
 }
 
-export async function syncVtopWithCookies(browserCookies: BrowserCookie[]) {
+export async function syncVtopWithCookies(browserCookies: BrowserCookie[], options?: VtopScrapeOptions) {
   if (!browserCookies.length) {
     throw new VtopScraperError("SESSION_EXPIRED", "Your VTOP session has expired. Reconnect with your VTOP Chennai credentials.")
   }
@@ -1169,7 +1660,7 @@ export async function syncVtopWithCookies(browserCookies: BrowserCookie[]) {
     }
     
     console.log("[VTOP] Cookie sync verified. Proceeding to scrape data...")
-    const data = await scrapeAll(page)
+    const data = await scrapeAll(page, options)
     const refreshedCookies = await context.cookies()
     return { data, browserCookies: refreshedCookies }
   } finally {

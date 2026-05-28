@@ -103,6 +103,7 @@ export type VtopSyncedData = {
   campus: "VTOP Chennai"
   source: typeof VTOP_CHENNAI_ORIGIN
   syncedAt: string
+  selectedSemesterId?: string
   profile?: VtopProfile
   attendance: VtopAttendanceRecord[]
   marks: VtopMarkRecord[]

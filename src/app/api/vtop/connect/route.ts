@@ -15,11 +15,13 @@ export async function POST(request: Request) {
       remember?: boolean
       captcha?: string
       challengeId?: string
+      semesterId?: string
     }
 
     const username = body.username?.trim()
     const password = body.password ?? ""
     const remember = Boolean(body.remember)
+    const semesterId = body.semesterId?.trim().toUpperCase()
 
     if (!username || !password) {
       return NextResponse.json(
@@ -40,14 +42,16 @@ export async function POST(request: Request) {
             password,
             challengeId: body.challengeId,
             captcha: body.captcha ?? "",
+            semesterId,
           })
-        : await syncVtopWithCredentials({ username, password })
+        : await syncVtopWithCredentials({ username, password, semesterId })
     const { data, browserCookies } = result
     const session: StoredVtopSession = {
       username,
       password: remember ? password : undefined,
       remember,
       browserCookies,
+      selectedSemesterId: data.selectedSemesterId ?? semesterId,
       lastSyncedAt: data.syncedAt,
       sessionExpiresAt: new Date(Date.now() + 1000 * 60 * 60 * 8).toISOString(),
     }
