@@ -10,6 +10,7 @@ export type StoredVtopSession = {
   password?: string
   remember: boolean
   browserCookies: Cookie[]
+  selectedSemesterId?: string
   lastSyncedAt?: string
   sessionExpiresAt?: string
 }

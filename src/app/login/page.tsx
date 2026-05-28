@@ -10,13 +10,41 @@ import { Input } from "@/components/ui/input"
 import { FooterDisclaimer } from "@/components/footer-disclaimer"
 import { setSessionMode, storeProfile } from "@/lib/app-session"
 import { useToast } from "@/components/toast-provider"
+import { writeStoredVtopData } from "@/hooks/use-vtop-sync"
 import type { VtopApiResponse } from "@/lib/vtop/types"
+
+function admissionYearFromUsername(username: string) {
+  const match = username.match(/\b(\d{2})[A-Z]{3}\d{4}\b/i) ?? username.match(/\b(\d{2})/)
+  if (!match) return new Date().getFullYear() - 1
+  const year = 2000 + Number(match[1])
+  return Number.isFinite(year) ? year : new Date().getFullYear() - 1
+}
+
+function semesterOptions(username: string) {
+  const startYear = admissionYearFromUsername(username)
+  const currentYear = new Date().getFullYear()
+  const options: Array<{ value: string; label: string }> = []
+
+  for (let year = startYear; year <= currentYear; year += 1) {
+    const next = String(year + 1).slice(-2)
+    for (let code = 1; code <= 30; code += 1) {
+      const value = `CH${year}${next}${String(code).padStart(2, "0")}`
+      options.push({
+        value,
+        label: `${year}-${next} · ${String(code).padStart(2, "0")}`,
+      })
+    }
+  }
+
+  return options.reverse()
+}
 
 export default function LoginPage() {
   const router = useRouter()
   const { notify } = useToast()
   const [loading, setLoading] = React.useState<"login" | "demo" | null>(null)
   const [status, setStatus] = React.useState<string>("")
+  const [usernameValue, setUsernameValue] = React.useState("")
   const [showPassword, setShowPassword] = React.useState(false)
   const [remember, setRemember] = React.useState(true)
   const [challenge, setChallenge] = React.useState<{ challengeId: string; captchaImage: string | null }>()
@@ -24,6 +52,7 @@ export default function LoginPage() {
   const [takingLong, setTakingLong] = React.useState(false)
   const [challengeError, setChallengeError] = React.useState<string>()
   const isSubmitting = React.useRef(false)
+  const semesters = React.useMemo(() => semesterOptions(usernameValue), [usernameValue])
 
   const loadChallenge = React.useCallback(async () => {
     setChallengeLoading(true)
@@ -85,6 +114,7 @@ export default function LoginPage() {
     const username = String(form.get("username") ?? "").trim()
     const password = String(form.get("password") ?? "")
     const captcha = String(form.get("captcha") ?? "").trim()
+    const semesterId = String(form.get("semesterId") ?? "").trim().toUpperCase()
 
     if (!username || !password || (challenge?.captchaImage && !captcha) || !challenge?.challengeId) {
       notify({
@@ -116,7 +146,7 @@ export default function LoginPage() {
       const response = await fetch("/api/vtop/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password, remember, captcha, challengeId: challenge.challengeId }),
+        body: JSON.stringify({ username, password, remember, captcha, challengeId: challenge.challengeId, semesterId }),
       })
       const payload = (await response.json()) as VtopApiResponse
       
@@ -138,6 +168,9 @@ export default function LoginPage() {
       }
       
       setStatus("Syncing academic data...")
+      if (payload.data) {
+        writeStoredVtopData(payload.data)
+      }
       if (payload.data?.profile) {
         storeProfile({
           fullName: payload.data.profile.fullName || username,
@@ -240,7 +273,14 @@ export default function LoginPage() {
               <form className="space-y-4" onSubmit={handleLogin}>
                 <div className="space-y-2">
                   <label className="text-[10px] uppercase tracking-widest text-muted-foreground">VTOP Username</label>
-                  <Input required name="username" placeholder="VTOP Chennai username" className="rounded-none bg-background" />
+                  <Input
+                    required
+                    name="username"
+                    placeholder="VTOP Chennai username"
+                    className="rounded-none bg-background"
+                    value={usernameValue}
+                    onChange={(event) => setUsernameValue(event.target.value.toUpperCase())}
+                  />
                 </div>
                 <div className="space-y-2">
                   <label className="text-[10px] uppercase tracking-widest text-muted-foreground">VTOP Password</label>
@@ -263,6 +303,21 @@ export default function LoginPage() {
                       {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                     </Button>
                   </div>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] uppercase tracking-widest text-muted-foreground">Semester</label>
+                  <select
+                    name="semesterId"
+                    className="h-10 w-full rounded-none border border-input bg-background px-3 text-sm uppercase text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                    defaultValue=""
+                  >
+                    <option value="">Auto-detect latest</option>
+                    {semesters.map((semester) => (
+                      <option key={semester.value} value={semester.value}>
+                        {semester.label} ({semester.value})
+                      </option>
+                    ))}
+                  </select>
                 </div>
                 <div className="space-y-2">
                   {challenge && !challenge.captchaImage ? (

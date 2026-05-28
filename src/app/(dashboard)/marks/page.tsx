@@ -11,7 +11,17 @@ import { FileText, RefreshCw } from "lucide-react"
 export default function MarksPage() {
   const { notify } = useToast()
   const vtop = useVtopSync()
-  const marks = vtop.data?.marks ?? []
+  const marks =
+    vtop.data?.marks.length
+      ? vtop.data.marks
+      : (vtop.data?.academicHistory ?? []).map((record) => ({
+          courseCode: record.courseCode ?? "",
+          courseTitle: record.courseTitle ?? "Course",
+          assessment: record.semester ? `${record.semester} final grade` : "Final grade",
+          scored: undefined,
+          max: undefined,
+          grade: record.grade,
+        }))
   const latest = vtop.data?.gpa.find((item) => item.cgpa || item.gpa)
   const graded = marks.filter((item) => item.grade).length
 
